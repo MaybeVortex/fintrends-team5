@@ -1,0 +1,439 @@
+
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 5,
+  fig.align = "center"
+)
+```
+
+# Setup & Package Installation
+
+Install packages if they are not already available, then load them.
+
+```{r packages}
+# Uncomment the lines below only the FIRST time you run this notebook
+# install.packages(c("quantmod", "TTR", "ggplot2", "plotly",
+#                    "forecast", "PerformanceAnalytics", "dplyr",
+#                    "zoo", "xts", "lubridate", "gridExtra"))
+
+library(quantmod)            # Fetching & handling financial time-series
+library(TTR)                 # Technical trading rules (SMA, EMA, runSD …)
+library(ggplot2)             # Grammar-of-graphics visualizations
+library(plotly)              # Interactive charts
+library(forecast)            # ARIMA modelling & forecasting
+library(PerformanceAnalytics) # Portfolio analytics
+library(dplyr)               # Data wrangling
+library(zoo)                 # Irregular time-series helpers
+library(xts)                 # Extensible time-series objects
+library(lubridate)           # Date arithmetic
+library(gridExtra)           # Multi-panel ggplot layouts
+```
+
+---
+
+# Fetching & Preprocessing Data
+
+## Single Stock — Apple (AAPL)
+
+`quantmod::getSymbols()` downloads OHLCV data from Yahoo Finance and stores it as an **xts** object in the global environment.
+
+```{r fetch-aapl}
+# Download AAPL data for 2020–2021
+getSymbols("AAPL", from = "2020-01-01", to = "2022-01-01", auto.assign = TRUE)
+
+# Adjust closing prices for stock splits and dividend payouts
+adjusted_data <- adjustOHLC(AAPL, use.Adjusted = TRUE)
+
+# Inspect the first few rows
+head(adjusted_data)
+```
+
+**Key columns produced by `getSymbols`:**
+
+| Column | Meaning |
+|--------|---------|
+| `AAPL.Open` | Opening price for the day |
+| `AAPL.High` | Highest intraday price |
+| `AAPL.Low` | Lowest intraday price |
+| `AAPL.Close` | Closing price |
+| `AAPL.Volume` | Total shares traded |
+| `AAPL.Adjusted` | Close price adjusted for corporate actions |
+
+---
+
+## Handling Missing Values
+
+Real-world financial data can have gaps (holidays, halted trading).
+
+```{r missing-values}
+# Count missing values per column
+na_count <- colSums(is.na(adjusted_data))
+cat("Missing values per column:\n")
+print(na_count)
+
+# Forward-fill any gaps (last observed value carried forward)
+adjusted_data_clean <- na.locf(adjusted_data)
+cat("\nMissing values after forward-fill:\n")
+print(colSums(is.na(adjusted_data_clean)))
+```
+
+---
+
+# Exploratory Data Analysis
+
+## Distribution of Daily Returns
+
+The **daily return** measures the percentage change from one trading day to the next.  
+$$r_t = \frac{P_t - P_{t-1}}{P_{t-1}}$$
+
+```{r daily-returns}
+# Compute daily returns from adjusted close
+returns <- dailyReturn(Cl(adjusted_data_clean))
+
+# Quick summary statistics
+summary(returns)
+cat("\nStandard deviation of daily returns:", round(sd(returns, na.rm = TRUE), 5), "\n")
+```
+
+```{r histogram-returns, fig.cap="Distribution of AAPL daily returns (2020-2021)"}
+# Convert xts to data frame for ggplot
+returns_df <- data.frame(
+  Date         = index(returns),
+  daily.returns = as.numeric(returns)
+)
+
+ggplot(returns_df, aes(x = daily.returns)) +
+  geom_histogram(bins = 60, fill = "#1a6faf", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = 0, color = "red", linewidth = 0.8, linetype = "dashed") +
+  geom_vline(xintercept = mean(returns_df$daily.returns, na.rm = TRUE),
+             color = "orange", linewidth = 0.8) +
+  labs(
+    title    = "Histogram of AAPL Daily Returns (2020–2021)",
+    subtitle = "Red dashed = zero  |  Orange = mean return",
+    x        = "Daily Return",
+    y        = "Frequency"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+# Moving Average Analysis
+
+## Fetching Multiple Stocks
+
+```{r fetch-multi}
+# Download AAPL, GOOG, and MSFT simultaneously
+getSymbols(c("AAPL", "GOOG", "MSFT"),
+           from = "2020-01-01", to = "2022-01-01",
+           auto.assign = TRUE)
+
+# Adjust for splits & dividends
+aapl_adj <- adjustOHLC(AAPL, use.Adjusted = TRUE)
+goog_adj <- adjustOHLC(GOOG, use.Adjusted = TRUE)
+msft_adj <- adjustOHLC(MSFT, use.Adjusted = TRUE)
+
+cat("AAPL rows:", nrow(aapl_adj),
+    "  GOOG rows:", nrow(goog_adj),
+    "  MSFT rows:", nrow(msft_adj), "\n")
+```
+
+## Computing Simple Moving Averages (SMA)
+
+The **Simple Moving Average** smooths noisy price data by averaging over a rolling window of *n* days:
+$$\text{SMA}(n)_t = \frac{1}{n}\sum_{i=0}^{n-1} P_{t-i}$$
+
+```{r sma}
+# 50-day SMA for each stock
+aapl_adj$SMA50 <- SMA(Cl(aapl_adj), n = 50)
+goog_adj$SMA50 <- SMA(Cl(goog_adj), n = 50)
+msft_adj$SMA50 <- SMA(Cl(msft_adj), n = 50)
+
+# Also compute a 20-day SMA for a faster signal
+aapl_adj$SMA20 <- SMA(Cl(aapl_adj), n = 20)
+```
+
+## Plotting AAPL with Moving Averages
+
+```{r plot-aapl-sma, fig.cap="AAPL adjusted close with 20-day and 50-day SMA"}
+aapl_df <- data.frame(
+  Date  = index(aapl_adj),
+  Close = as.numeric(Cl(aapl_adj)),
+  SMA20 = as.numeric(aapl_adj$SMA20),
+  SMA50 = as.numeric(aapl_adj$SMA50)
+)
+
+ggplot(aapl_df, aes(x = Date)) +
+  geom_line(aes(y = Close, color = "Close Price"), linewidth = 0.6, alpha = 0.7) +
+  geom_line(aes(y = SMA20, color = "20-day SMA"), linewidth = 0.9) +
+  geom_line(aes(y = SMA50, color = "50-day SMA"), linewidth = 0.9) +
+  scale_color_manual(values = c("Close Price" = "#aec6e8",
+                                 "20-day SMA"  = "#ff7f0e",
+                                 "50-day SMA"  = "#d62728")) +
+  labs(title    = "AAPL Adjusted Closing Prices with Moving Averages",
+       subtitle = "2020–2021 | Golden/Death Cross signals visible",
+       x = "Date", y = "Adjusted Close (USD)", color = "Legend") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top",
+        plot.title = element_text(face = "bold"))
+```
+
+## Plotting GOOG with 50-day SMA
+
+```{r plot-goog-sma, fig.cap="GOOG adjusted close with 50-day SMA"}
+goog_df <- data.frame(
+  Date  = index(goog_adj),
+  Close = as.numeric(Cl(goog_adj)),
+  SMA50 = as.numeric(goog_adj$SMA50)
+)
+
+ggplot(goog_df, aes(x = Date)) +
+  geom_line(aes(y = Close, color = "Close Price"), linewidth = 0.6, alpha = 0.7) +
+  geom_line(aes(y = SMA50, color = "50-day SMA"), linewidth = 0.9) +
+  scale_color_manual(values = c("Close Price" = "#98df8a", "50-day SMA" = "#2ca02c")) +
+  labs(title = "GOOG Adjusted Closing Prices with 50-day SMA",
+       x = "Date", y = "Adjusted Close (USD)", color = "Legend") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top", plot.title = element_text(face = "bold"))
+```
+
+## Plotting MSFT with 50-day SMA
+
+```{r plot-msft-sma, fig.cap="MSFT adjusted close with 50-day SMA"}
+msft_df <- data.frame(
+  Date  = index(msft_adj),
+  Close = as.numeric(Cl(msft_adj)),
+  SMA50 = as.numeric(msft_adj$SMA50)
+)
+
+ggplot(msft_df, aes(x = Date)) +
+  geom_line(aes(y = Close, color = "Close Price"), linewidth = 0.6, alpha = 0.7) +
+  geom_line(aes(y = SMA50, color = "50-day SMA"), linewidth = 0.9) +
+  scale_color_manual(values = c("Close Price" = "#ffbb78", "50-day SMA" = "#ff7f0e")) +
+  labs(title = "MSFT Adjusted Closing Prices with 50-day SMA",
+       x = "Date", y = "Adjusted Close (USD)", color = "Legend") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top", plot.title = element_text(face = "bold"))
+```
+
+---
+
+# Volatility Analysis
+
+Volatility measures **how much prices fluctuate** over time. High volatility = higher risk and potential reward.
+
+We use a **rolling standard deviation** over a 20-day window:
+$$\sigma_t^{(20)} = \text{std}(P_{t-19}, \ldots, P_t)$$
+
+```{r rolling-vol}
+# 20-day rolling standard deviation for each stock
+aapl_adj$Volatility <- runSD(Cl(aapl_adj), n = 20)
+goog_adj$Volatility <- runSD(Cl(goog_adj), n = 20)
+msft_adj$Volatility <- runSD(Cl(msft_adj), n = 20)
+```
+
+## Individual Volatility Plots
+
+```{r plot-aapl-vol, fig.cap="AAPL 20-day rolling volatility"}
+aapl_vol_df <- data.frame(
+  Date       = index(aapl_adj),
+  Volatility = as.numeric(aapl_adj$Volatility)
+)
+
+ggplot(aapl_vol_df, aes(x = Date, y = Volatility)) +
+  geom_line(color = "#1a6faf", linewidth = 0.8) +
+  geom_smooth(method = "loess", se = TRUE, color = "red", linewidth = 0.6, alpha = 0.2) +
+  labs(title    = "AAPL — 20-Day Rolling Volatility",
+       subtitle = "Shaded band = LOESS smoothing confidence interval",
+       x = "Date", y = "Rolling Std. Dev (USD)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+## Comparative Volatility — All Three Stocks
+
+```{r compare-volatility, fig.cap="Comparative volatility: AAPL vs GOOG vs MSFT"}
+# Merge into one data frame
+vol_df <- data.frame(
+  Date = index(aapl_adj),
+  AAPL = as.numeric(aapl_adj$Volatility),
+  GOOG = as.numeric(goog_adj$Volatility),
+  MSFT = as.numeric(msft_adj$Volatility)
+)
+
+# Reshape to long format
+vol_long <- tidyr::pivot_longer(vol_df, cols = c("AAPL", "GOOG", "MSFT"),
+                                names_to = "Stock", values_to = "Volatility")
+
+ggplot(vol_long, aes(x = Date, y = Volatility, color = Stock)) +
+  geom_line(linewidth = 0.7, alpha = 0.9) +
+  scale_color_manual(values = c("AAPL" = "#1a6faf",
+                                 "GOOG" = "#2ca02c",
+                                 "MSFT" = "#ff7f0e")) +
+  labs(title    = "Comparative 20-Day Rolling Volatility",
+       subtitle = "AAPL vs GOOG vs MSFT (2020–2021)",
+       x = "Date", y = "Rolling Std. Dev (USD)", color = "Stock") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top", plot.title = element_text(face = "bold"))
+```
+
+---
+
+# Correlation Analysis
+
+```{r correlation}
+# Align closing prices into a single xts matrix
+prices <- merge(Cl(aapl_adj), Cl(goog_adj), Cl(msft_adj))
+colnames(prices) <- c("AAPL", "GOOG", "MSFT")
+
+# Compute pairwise correlation of daily returns
+ret_matrix <- diff(log(prices))  # log returns
+cor_matrix  <- cor(ret_matrix, use = "complete.obs")
+cat("Pairwise Correlation Matrix (log returns):\n")
+round(cor_matrix, 4)
+```
+
+```{r cor-heatmap, fig.cap="Correlation heatmap of log returns"}
+cor_df <- reshape2::melt(cor_matrix)
+ggplot(cor_df, aes(x = Var1, y = Var2, fill = value, label = round(value, 3))) +
+  geom_tile(color = "white") +
+  geom_text(size = 5, fontface = "bold") +
+  scale_fill_gradient2(low = "#d73027", mid = "#ffffbf", high = "#1a9850",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "Correlation Heatmap — AAPL, GOOG, MSFT Daily Log Returns",
+       x = NULL, y = NULL, fill = "ρ") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text  = element_text(size = 12))
+```
+
+---
+
+# Predictive Modelling — ARIMA Forecasting
+
+## What is ARIMA?
+
+**ARIMA(p, d, q)** — AutoRegressive Integrated Moving Average — is one of the most widely used time-series forecasting models:
+
+| Parameter | Role |
+|-----------|------|
+| **p** | Number of autoregressive lags |
+| **d** | Degree of differencing (to achieve stationarity) |
+| **q** | Number of moving-average lags |
+
+`forecast::auto.arima()` automatically selects optimal (p, d, q) using AIC/BIC.
+
+## Fitting the Model on AAPL
+
+```{r arima-fit}
+# Extract the closing price as a plain numeric vector
+aapl_close <- as.numeric(Cl(aapl_adj))
+
+# auto.arima selects optimal order by minimising AIC
+arima_model <- auto.arima(aapl_close, seasonal = FALSE, stepwise = FALSE,
+                           approximation = FALSE, trace = FALSE)
+summary(arima_model)
+```
+
+## Generating a 30-Day Forecast
+
+```{r arima-forecast, fig.cap="AAPL 30-day forecast using ARIMA"}
+# Forecast 30 trading days ahead
+fc <- forecast(arima_model, h = 30, level = c(80, 95))
+
+# Build a tidy data frame for plotting
+n       <- length(aapl_close)
+dates   <- index(aapl_adj)
+fc_dates <- seq(tail(dates, 1) + 1, by = "day", length.out = 30)
+
+hist_df <- data.frame(Date = dates, Price = aapl_close, Type = "Historical")
+fc_df   <- data.frame(
+  Date   = fc_dates,
+  Price  = as.numeric(fc$mean),
+  Lo80   = as.numeric(fc$lower[, 1]),
+  Hi80   = as.numeric(fc$upper[, 1]),
+  Lo95   = as.numeric(fc$lower[, 2]),
+  Hi95   = as.numeric(fc$upper[, 2])
+)
+
+ggplot() +
+  geom_line(data = tail(hist_df, 120),
+            aes(x = Date, y = Price), color = "#1a6faf", linewidth = 0.7) +
+  geom_ribbon(data = fc_df, aes(x = Date, ymin = Lo95, ymax = Hi95),
+              fill = "#d62728", alpha = 0.15) +
+  geom_ribbon(data = fc_df, aes(x = Date, ymin = Lo80, ymax = Hi80),
+              fill = "#d62728", alpha = 0.30) +
+  geom_line(data = fc_df, aes(x = Date, y = Price),
+            color = "#d62728", linewidth = 0.9, linetype = "dashed") +
+  labs(title    = "AAPL — ARIMA 30-Day Price Forecast",
+       subtitle = "Dark band = 80% CI  |  Light band = 95% CI",
+       x = "Date", y = "Adjusted Close (USD)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+# Interactive Visualization with Plotly
+
+```{r plotly-chart, fig.cap="Interactive AAPL price chart (hover for details)"}
+aapl_plot_df <- data.frame(
+  Date  = index(aapl_adj),
+  Open  = as.numeric(Op(aapl_adj)),
+  High  = as.numeric(Hi(aapl_adj)),
+  Low   = as.numeric(Lo(aapl_adj)),
+  Close = as.numeric(Cl(aapl_adj))
+)
+
+plot_ly(aapl_plot_df,
+        x    = ~Date,
+        type = "candlestick",
+        open = ~Open, close = ~Close,
+        high = ~High, low   = ~Low,
+        name = "AAPL") %>%
+  layout(
+    title   = "AAPL — Candlestick Chart (2020–2021)",
+    xaxis   = list(title = "Date", rangeslider = list(visible = TRUE)),
+    yaxis   = list(title = "Price (USD)")
+  )
+```
+
+---
+
+# Summary & Key Takeaways
+
+```{r summary-stats}
+# Compute key metrics for each stock
+stocks_list <- list(AAPL = aapl_adj, GOOG = goog_adj, MSFT = msft_adj)
+
+summary_table <- lapply(names(stocks_list), function(ticker) {
+  s      <- stocks_list[[ticker]]
+  ret    <- dailyReturn(Cl(s))
+  data.frame(
+    Stock          = ticker,
+    Start_Price    = round(as.numeric(first(Cl(s))), 2),
+    End_Price      = round(as.numeric(last(Cl(s))), 2),
+    Total_Return_pct = round((as.numeric(last(Cl(s))) / as.numeric(first(Cl(s))) - 1) * 100, 2),
+    Ann_Volatility_pct = round(sd(ret, na.rm = TRUE) * sqrt(252) * 100, 2),
+    Max_Daily_Return  = round(max(ret, na.rm = TRUE) * 100, 3),
+    Min_Daily_Return  = round(min(ret, na.rm = TRUE) * 100, 3)
+  )
+})
+
+final_summary <- do.call(rbind, summary_table)
+knitr::kable(final_summary,
+             caption = "Summary Statistics — AAPL, GOOG, MSFT (2020–2021)",
+             align = "c")
+```
